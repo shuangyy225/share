@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Qwen3-32B LoRA微调代码 - 昇腾910B2版本
+适用于：8张昇腾910B2显卡，每张64G显存
+系统：openEuler + MindIE镜像
+"""
+
+# ========================
+# 第一步：导入必要的库
+# ========================
+print("正在导入必要的库...")
+
+# 基础库
+import os
+import json
+from typing import Dict, List
+
+# 机器学习相关库
+import torch
+from torch.utils.data import Dataset
+
+# HuggingFace相关库
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    TrainingArguments,
+    Trainer,
+    DataCollatorForLanguageModeling
+)
+
+# LoRA相关库（PEFT）
+from peft import LoraConfig, get_peft_model, TaskType
+
+# 昇腾相关库
+import torch_npu  # 昇腾NPU支持
+from torch_npu.npu import amp
+from torch_npu.contrib import transfer_to_npu  # 自动将CUDA代码转为NPU
+
+print("库导入完成！")
+
+# ========================
+# 第二步：环境配置
+# ========================
+print("正在配置昇腾环境...")
+
+# 设置昇腾设备
+os.environ['ASCEND_HOME'] = '/usr/local/Ascend'
+os.environ['LD_LIBRARY_PATH'] = '/usr/local/Ascend/lib64:' + os.environ.get('LD_LIBRARY_PATH', '')
+os.environ['PYTHONPATH'] = '/usr/local/python/site-packages:' + os.environ.get('PYTHONPATH', '')
+
+# 设置使用所有8张NPU卡
+os.environ['RANK'] = '0'
+os.environ['WORLD_SIZE'] = '8'
+os.environ['MASTER_ADDR'] = '127.0.0.1'
+os.environ['MASTER_PORT'] = '29500'
+
+print("昇腾环境配置完成！")
+
+# ========================
+# 第三步：准备训练数据
+# ========================
+print("正在准备训练数据...")
+
+# 这里是一个简单的示例数据集
+# 你可以根据需要修改这些数据
+sample_data = [
+    {
+        "instruction": "你好",
+        "output": "你好！我是Qwen，阿里巴巴开发的大型语言模型。很高兴为你服务！"
+    },
+    {
+        "instruction": "介绍一下你自己",
+        "output": "我是Qwen3，是阿里巴巴最新推出的超大规模语言模型。我可以回答问题、创作文字、进行逻辑推理等。"
+    },
+    {
+        "instruction": "你能做什么？",
+        "output": "我可以帮助你回答问题、写故事、写公文、写邮件、写剧本等等，还能进行逻辑推理和编程。"
+    },
+    {
+        "instruction": "今天天气怎么样？",
+        "output": "我无法获取实时天气信息。建议你查看天气预报应用或网站获取准确信息。"
+    },
+    {
+        "instruction": "帮我写一篇关于春天的短文",
+        "output": "春天是一年中最美好的季节之一。万物复苏，花儿绽放，鸟儿歌唱。温暖的阳光洒在大地上，给人们带来希望和活力。"
+    }
+]
+
+# 保存数据到文件（方便后续修改）
+def save_sample_data():
+    """保存示例数据到JSON文件"""
+    with open('training_data.json', 'w', encoding='utf-8') as f:
+        json.dump(sample_data, f, ensure_ascii=False, indent=2)
+    print("示例数据已保存到 training_data.json")
+
+# 加载数据函数
+def load_training_data(file_path='training_data.json'):
+    """从JSON文件加载训练数据"""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        print(f"成功加载 {len(data)} 条训练数据")
+        return data
+    except FileNotFoundError:
+        print("未找到数据文件，使用示例数据")
+        save_sample_data()
+        return sample_data
+
+# ========================
+# 第四步：创建数据集类
+# ========================
+class QwenDataset(Dataset):
+    """自定义数据集类"""
+
+    def __init__(self, data_list: List[Dict], tokenizer, max_length: int = 512):
+        """
+        初始化数据集
+        :param data_list: 数据列表
+        :param tokenizer: 分词器
+        :param max_length: 最大序列长度
+        """
+        self.data = data_list
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __len__(self):
+        """返回数据集大小"""
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        """获取单条数据"""
+        item = self.data[idx]
+
+        # 构造输入文本
+        text = f"用户：{item['instruction']}\n助手：{item['output']}"
+
+        # 使用分词器处理文本
+        encoding = self.tokenizer(
+            text,
+            truncation=True,           # 超长截断
+            padding='max_length',      # 填充到最大长度
+            max_length=self.max_length,
+            return_tensors='pt'        # 返回PyTorch张量
+        )
+
+        # 返回输入和标签（因果语言模型中输入和标签相同）
+        return {
+            'input_ids': encoding['input_ids'].flatten(),
+            'attention_mask': encoding['attention_mask'].flatten(),
+            'labels': encoding['input_ids'].flatten()
+        }
+
+# ========================
+# 第五步：模型加载和配置
+# ========================
+print("正在加载模型和分词器...")
+
+
+def load_model_and_tokenizer(model_path="/home/data/model/qwen32B"):
+    """
+    加载模型和分词器（最严格的兼容配置）
+    """
+    print("正在加载分词器...")
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        local_files_only=True
+    )
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    print("正在加载模型...")
+
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.float16,
+            device_map={"": 0},  # 强制使用单个设备
+            trust_remote_code=True,
+            local_files_only=True,
+            attn_implementation="eager",
+            use_flash_attention_2=False,
+            low_cpu_mem_usage=True,
+            ignore_mismatched_sizes=True,  # 忽略大小不匹配
+        )
+    except Exception as e:
+        print(f"第一次加载失败，尝试备用方案: {e}")
+        # 备用加载方案
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.float16,
+            device_map="sequential",
+            trust_remote_code=True,
+            local_files_only=True,
+            attn_implementation="eager",
+            use_flash_attention_2=False,
+            low_cpu_mem_usage=True,
+        )
+
+    print("模型加载完成！")
+    return model, tokenizer
+
+
+# ========================
+# 第六步：配置LoRA参数
+# ========================
+def setup_lora_config():
+    """
+    配置LoRA微调参数
+    """
+    print("正在配置LoRA参数...")
+
+    lora_config = LoraConfig(
+        r=8,                    # LoRA秩（越小越节省资源）
+        lora_alpha=32,          # LoRA缩放因子
+        target_modules=[        # 指定要应用LoRA的模块
+            "q_proj",          # 查询投影
+            "v_proj"           # 值投影
+        ],
+        lora_dropout=0.05,      # Dropout率
+        bias="none",            # 不训练偏置项
+        task_type=TaskType.CAUSAL_LM  # 任务类型：因果语言模型
+    )
+
+    print("LoRA配置完成！")
+    return lora_config
+
+# ========================
+# 第七步：训练配置
+# ========================
+def setup_training_args():
+    """
+    设置训练参数
+    """
+    print("正在设置训练参数...")
+
+    training_args = TrainingArguments(
+        # 输出目录
+        output_dir="./qwen3-lora-output",
+
+        # 训练参数
+        per_device_train_batch_size=1,      # 每设备批次大小
+        gradient_accumulation_steps=8,      # 梯度累积步数
+        num_train_epochs=3,                 # 训练轮数
+        learning_rate=2e-4,                 # 学习率
+
+        # 硬件相关
+        fp16=True,                          # 使用半精度训练
+        dataloader_pin_memory=False,        # NPU环境下建议关闭
+
+        # 日志和保存
+        logging_steps=10,                   # 日志间隔
+        save_steps=100,                     # 保存间隔
+        save_total_limit=2,                 # 最多保存模型数量
+
+        # 其他设置
+        report_to="none",                   # 不使用外部日志工具
+        remove_unused_columns=False,        # 保留所有列
+
+        # 昇腾NPU特定设置
+        ddp_find_unused_parameters=False,   # 分布式训练设置
+    )
+
+    print("训练参数设置完成！")
+    return training_args
+
+# ========================
+# 第八步：主训练函数
+# ========================
+def main():
+    """主训练函数"""
+    print("=" * 50)
+    print("🚀 开始Qwen3-32B LoRA微调训练")
+    print("=" * 50)
+
+    try:
+        # 1. 加载训练数据
+        print("\n📋 步骤1：加载训练数据")
+        training_data = load_training_data()
+
+        # 2. 加载模型和分词器
+        print("\n🤖 步骤2：加载模型和分词器")
+        model, tokenizer = load_model_and_tokenizer("/home/data/model/qwen32B")
+
+        # 3. 应用LoRA配置
+        print("\n🔧 步骤3：应用LoRA配置")
+        lora_config = setup_lora_config()
+        model = get_peft_model(model, lora_config)
+
+        # 显示可训练参数信息
+        model.print_trainable_parameters()
+
+        # 4. 创建数据集
+        print("\n📚 步骤4：创建训练数据集")
+        train_dataset = QwenDataset(training_data, tokenizer)
+
+        # 5. 设置训练参数
+        print("\n⚙️ 步骤5：设置训练参数")
+        training_args = setup_training_args()
+
+        # 6. 创建训练器
+        print("\n🏋️ 步骤6：创建训练器")
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            tokenizer=tokenizer,
+            data_collator=DataCollatorForLanguageModeling(
+                tokenizer=tokenizer,
+                mlm=False  # 不使用掩码语言模型
+            )
+        )
+
+        # 7. 开始训练
+        print("\n🔥 步骤7：开始训练")
+        trainer.train()
+
+        # 8. 保存最终模型
+        print("\n💾 步骤8：保存最终模型")
+        trainer.save_model("./qwen3-lora-final-model")
+        tokenizer.save_pretrained("./qwen3-lora-final-model")
+
+        print("\n🎉 训练完成！模型已保存到 ./qwen3-lora-final-model")
+
+    except Exception as e:
+        print(f"\n❌ 训练过程中出现错误：{str(e)}")
+        import traceback
+        traceback.print_exc()
+
+# ========================
+# 第九步：测试函数
+# ========================
+def test_model():
+    """测试微调后的模型"""
+    print("\n🔍 测试微调后的模型")
+
+    try:
+        # 加载微调后的模型和分词器
+        model_path = "./qwen3-lora-final-model"
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.float16,
+            device_map="auto"
+        )
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+        # 测试示例
+        test_prompts = [
+            "用户：你好\n助手：",
+            "用户：你能做什么？\n助手：",
+            "用户：介绍一下AI\n助手："
+        ]
+
+        for prompt in test_prompts:
+            print(f"\n输入：{prompt}")
+
+            # 编码输入
+            inputs = tokenizer(prompt, return_tensors="pt").to("npu")
+
+            # 生成输出
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=100,
+                    temperature=0.7,
+                    do_sample=True
+                )
+
+            # 解码输出
+            result = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            print(f"输出：{result}")
+
+    except Exception as e:
+        print(f"测试过程中出现错误：{str(e)}")
+
+# ========================
+# 第十步：使用说明
+# ========================
+def print_usage_instructions():
+    """打印使用说明"""
+    print("\n" + "=" * 60)
+    print("📖 使用说明")
+    print("=" * 60)
+    print("1. 准备训练数据：")
+    print("   - 修改 training_data.json 文件")
+    print("   - 添加更多问答对来提高模型效果")
+    print()
+    print("2. 运行训练：")
+    print("   python qwen3_lora_finetune.py")
+    print()
+    print("3. 测试模型：")
+    print("   python qwen3_lora_finetune.py --test")
+    print()
+    print("4. 模型保存位置：")
+    print("   ./qwen3-lora-final-model/")
+    print("=" * 60)
+
+# ========================
+# 程序入口点
+# ========================
+if __name__ == "__main__":
+    import sys
+
+    # 检查是否是测试模式
+    if "--test" in sys.argv:
+        test_model()
+    else:
+        # 显示使用说明
+        print_usage_instructions()
+
+        # 确认开始训练
+        user_input = input("\n是否开始训练？(y/n): ")
+        if user_input.lower() in ['y', 'yes', '是']:
+            main()
+        else:
+            print("训练已取消")
+
